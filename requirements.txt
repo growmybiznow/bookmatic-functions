@@ -1,1 +1,4 @@
-# Puedes dejarlo vacío si no usas paquetes externos
+openai
+boto3
+flask
+PyMuPDF
