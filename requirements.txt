@@ -1,4 +1,5 @@
-openai
-boto3
 Flask==2.2.5
+gunicorn==21.2.0
+boto3
+openai
 PyMuPDF
