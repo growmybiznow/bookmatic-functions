@@ -1,4 +1,4 @@
 openai
 boto3
-flask
+Flask==2.2.5
 PyMuPDF
