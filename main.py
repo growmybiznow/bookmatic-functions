@@ -14,7 +14,9 @@ app = Flask(__name__)
 
 # Configuración de OpenAI y R2
 openai.api_key = os.getenv("OPENAI_API_KEY")
-R2_ENDPOINT = os.getenv("R2_ENDPOINT_URL")
+
+# Aquí usamos R2_ENDPOINT (no R2_ENDPOINT_URL)
+R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_KEY = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET = os.getenv("R2_SECRET_ACCESS_KEY")
 BUCKET_NAME = "bookmatic"
