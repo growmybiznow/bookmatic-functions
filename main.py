@@ -128,7 +128,6 @@ def analyze_pdf():
             # Extraer portada
             cover_path = os.path.join(tmp, clean_filename(os.path.basename(pdf_key)) + "_cover.jpg")
             if not extract_mp3_cover(local_file, cover_path):
-                # no cover found
                 cover_path = None
             # Transcripción
             extracted_text = transcribe_audio(local_file)
