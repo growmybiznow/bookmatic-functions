@@ -1,155 +1,164 @@
 import os
+import io
 import json
 import re
+import fitz
 import boto3
-import fitz  # PyMuPDF
+import openai
+import tempfile
 from flask import Flask, request, jsonify
-from openai import OpenAI
+from mutagen.id3 import ID3
+import google.generativeai as genai
 
-# Inicializar Flask
+# Inicialización
 app = Flask(__name__)
 
-# Configuración de Cloudflare R2
-R2_BUCKET = os.getenv("R2_BUCKET", "bookmatic")
-R2_ENDPOINT = os.getenv("R2_ENDPOINT")
-R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY_ID")
-R2_SECRET_KEY = os.getenv("R2_SECRET_ACCESS_KEY")
-
+# Configurar clientes
+openai.api_key = os.getenv("OPENAI_API_KEY")
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
 s3 = boto3.client(
     "s3",
-    endpoint_url=R2_ENDPOINT,
-    aws_access_key_id=R2_ACCESS_KEY,
-    aws_secret_access_key=R2_SECRET_KEY
+    endpoint_url=os.getenv("R2_ENDPOINT"),
+    aws_access_key_id=os.getenv("R2_ACCESS_KEY_ID"),
+    aws_secret_access_key=os.getenv("R2_SECRET_ACCESS_KEY"),
 )
+BUCKET = os.getenv("R2_BUCKET", "bookmatic")
 
-# Cliente OpenAI
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Utilidades
+def clean_filename(text):
+    text = re.sub(r'[^a-zA-Z0-9]+', '_', text.lower())
+    return text.strip('_')
 
-
-def clean_filename(text: str) -> str:
-    """Limpia un texto para usarlo como nombre de archivo/carpeta"""
-    text = re.sub(r'[^a-zA-Z0-9]+', '_', text.strip())
-    return text.lower().strip('_')
-
-
-def extract_pdf_text_and_cover(local_path):
-    """Extraer texto (páginas 2 a 6) y generar portada JPG"""
-    doc = fitz.open(local_path)
-
-    # Guardar imagen portada
-    cover_image = doc[0].get_pixmap(dpi=150)
-    cover_path = local_path.replace(".pdf", "_cover.jpg")
-    cover_image.save(cover_path)
-
-    # Extraer texto de páginas 2 a 6
-    extracted_text = ""
-    for i in range(1, min(6, len(doc))):
-        extracted_text += doc[i].get_text()
-    doc.close()
-
-    return extracted_text, cover_path
-
-
-def analyze_with_openai(text: str) -> dict:
-    """Llama a OpenAI y devuelve un JSON limpio"""
+def generate_metadata_with_gemini(text):
     prompt = f"""
-Analyze this text and return ONLY a valid JSON object with these keys:
+Analyze the following content and return a JSON with:
 - clean_title
 - full_title
-- summary (3 descriptive lines)
-- category (precise, with subcategory like Business/Entrepreneurship or Business/Marketing)
-- key_ideas (5 bullet points with the most important concepts)
-- target_audience (who is this book aimed at)
-- index (main sections)
-- reddit_post (short promotional text)
+- summary: 3 bullet points (list, not paragraph)
+- category (e.g., Business/Marketing)
+- key_ideas (list of 3-5)
+- target_audience
+- index (structured sections or chapters)
+- reddit_post (short social post)
 
-Text:
-{text[:3500]}
+Return ONLY valid JSON.
+
+TEXT:
+{text[:6000]}
 """
-
-    response = openai_client.chat.completions.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-    )
-
-    raw_content = response.choices[0].message.content
-
-    # Asegurar que el contenido es JSON válido
+    model = genai.GenerativeModel("gemini-1.5-flash")
+    resp = model.generate_content(prompt)
     try:
-        start = raw_content.find('{')
-        end = raw_content.rfind('}') + 1
-        json_str = raw_content[start:end]
-        data = json.loads(json_str)
-    except Exception as e:
-        # Si falla, guardar como texto plano
-        data = {"raw_text": raw_content, "error": str(e)}
+        raw_text = resp.text.strip()
+        start = raw_text.find("{")
+        end = raw_text.rfind("}")
+        return json.loads(raw_text[start:end+1])
+    except Exception:
+        return {"error": "Failed to parse Gemini output", "raw_text": resp.text}
 
-    return data
+def extract_pdf_text_and_cover(local_file):
+    doc = fitz.open(local_file)
+    cover_path = local_file.replace('.pdf', '_cover.jpg')
+    pix = doc[0].get_pixmap(dpi=150)
+    pix.save(cover_path)
+    text = ""
+    for i in range(1, min(6, len(doc))):
+        text += doc[i].get_text()
+    doc.close()
+    return text, cover_path
 
+def extract_mp3_cover(local_file, cover_output_path):
+    try:
+        tags = ID3(local_file)
+        for tag in tags.values():
+            if tag.FrameID == "APIC":
+                with open(cover_output_path, "wb") as f:
+                    f.write(tag.data)
+                return True
+    except Exception:
+        pass
+    return False
+
+def transcribe_audio(local_file):
+    with open(local_file, "rb") as audio_file:
+        transcript = openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file
+        )
+    return transcript.text
 
 @app.route("/", methods=["GET"])
 def home():
     return "Bookmatic Cloud Run is working!", 200
 
-
 @app.route("/analyze-pdf", methods=["POST"])
 def analyze_pdf():
     data = request.get_json()
     pdf_key = data.get("pdf_key")
-
     if not pdf_key:
         return jsonify({"error": "pdf_key is required"}), 400
 
-    # Paths en R2
-    base_path = os.path.dirname(pdf_key)
-    clean_base = clean_filename(os.path.splitext(os.path.basename(pdf_key))[0])
-
-    # Cover ahora tiene el título en el nombre
-    cover_key = f"{base_path}/{clean_base}/cover_{clean_base}.jpg"
-    metadata_key = f"{base_path}/{clean_base}/metadata.json"
-
-    # Si ya existe metadata, no reprocesar
+    # Verificar si ya existe metadata
+    base_key = "/".join(pdf_key.split("/")[:-1])
+    metadata_key = f"{base_key}/metadata.json"
     try:
-        s3.head_object(Bucket=R2_BUCKET, Key=metadata_key)
+        s3.head_object(Bucket=BUCKET, Key=metadata_key)
         return jsonify({
+            "cover_image": f"{base_key}/cover.jpg",
             "file": pdf_key,
-            "cover_image": cover_key,
             "metadata_json": metadata_key,
             "status": "already_processed"
         })
     except Exception:
         pass
 
-    # Descargar PDF a /tmp
-    tmp_pdf = f"/tmp/{os.path.basename(pdf_key)}"
-    s3.download_file(R2_BUCKET, pdf_key, tmp_pdf)
+    # Descargar archivo
+    with tempfile.TemporaryDirectory() as tmp:
+        local_file = os.path.join(tmp, os.path.basename(pdf_key))
+        s3.download_file(BUCKET, pdf_key, local_file)
 
-    # Extraer texto y portada
-    extracted_text, cover_path = extract_pdf_text_and_cover(tmp_pdf)
+        file_ext = os.path.splitext(pdf_key)[1].lower()
+        extracted_text = ""
+        cover_path = None
 
-    # Generar metadatos enriquecidos
-    metadata_json = analyze_with_openai(extracted_text)
+        if file_ext == ".pdf":
+            extracted_text, cover_path = extract_pdf_text_and_cover(local_file)
 
-    # Subir cover
-    with open(cover_path, "rb") as f:
-        s3.upload_fileobj(f, R2_BUCKET, cover_key)
+        elif file_ext == ".mp3":
+            # Extraer portada
+            cover_path = os.path.join(tmp, clean_filename(os.path.basename(pdf_key)) + "_cover.jpg")
+            if not extract_mp3_cover(local_file, cover_path):
+                # no cover found
+                cover_path = None
+            # Transcripción
+            extracted_text = transcribe_audio(local_file)
+        else:
+            return jsonify({"error": "Unsupported file type"}), 400
 
-    # Subir metadata.json limpio
-    s3.put_object(
-        Bucket=R2_BUCKET,
-        Key=metadata_key,
-        Body=json.dumps(metadata_json, indent=2),
-        ContentType="application/json"
-    )
+        # Metadata con Gemini
+        metadata = generate_metadata_with_gemini(extracted_text)
+
+        # Guardar cover si existe
+        cover_key = None
+        if cover_path and os.path.exists(cover_path):
+            cover_key = f"{base_key}/cover_{metadata.get('clean_title','file')}.jpg"
+            s3.upload_file(cover_path, BUCKET, cover_key, ExtraArgs={"ContentType": "image/jpeg"})
+
+        # Subir metadata.json
+        metadata_key = f"{base_key}/metadata.json"
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=metadata_key,
+            Body=json.dumps(metadata, indent=2),
+            ContentType="application/json"
+        )
 
     return jsonify({
-        "file": pdf_key,
+        "pdf_key": pdf_key,
         "cover_image_uploaded_to": cover_key,
         "metadata_json_uploaded_to": metadata_key,
-        "metadata": metadata_json
+        "metadata": metadata
     })
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))

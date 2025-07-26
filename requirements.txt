@@ -1,5 +1,7 @@
 Flask==2.2.5
 gunicorn==21.2.0
 boto3
-openai==0.28
+openai
 PyMuPDF
+mutagen
+google-generativeai
