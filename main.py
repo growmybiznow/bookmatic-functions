@@ -5,14 +5,14 @@ import json
 import traceback
 import boto3
 import fitz  # PyMuPDF
-import openai
+from openai import OpenAI
 
 # -------------------------------------------------------------------
-# CONFIGURACIÓN
+# CONFIG
 # -------------------------------------------------------------------
 app = Flask(__name__)
 
-openai.api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_KEY = os.getenv("R2_ACCESS_KEY_ID")
@@ -27,14 +27,14 @@ s3 = boto3.client(
 )
 
 # -------------------------------------------------------------------
-# FUNCIONES DE UTILIDAD
+# UTILITIES
 # -------------------------------------------------------------------
 
 def clean_filename(text: str) -> str:
     return re.sub(r'[^a-zA-Z0-9]+', '_', text.lower()).strip('_')
 
 def extract_pdf_text_and_cover(local_file):
-    """Extraer texto (páginas 2-6) y generar imagen JPG de la portada."""
+    """Extract text (pages 2-6) and generate cover JPG."""
     doc = fitz.open(local_file)
     cover_image = doc[0].get_pixmap(dpi=150)
     cover_path = local_file.replace(".pdf", "_cover.jpg")
@@ -46,20 +46,31 @@ def extract_pdf_text_and_cover(local_file):
     return extracted_text, cover_path
 
 def get_book_metadata(extracted_text):
-    """Pedir a OpenAI que genere metadatos estructurados en JSON."""
+    """Use OpenAI to generate rich metadata."""
     prompt = f"""
-Analyze this text and return JSON with:
-- clean_title
-- full_title
-- summary (3 lines)
-- category (Business/Marketing/etc.)
-- index (main sections)
-- reddit_post (short promotional text)
+Analyze the following book content and return a JSON with these fields:
 
-Text:
+- clean_title: short slug
+- full_title
+- summary: 3 sentences explaining the book
+- category: a precise path like Business/Marketing/LeadGeneration
+- target_audience
+- level: beginner / intermediate / advanced
+- key_insights: 5-7 bullet points
+- index: main chapters or sections
+- content_ideas:
+    guides: 3 titles
+    articles: 3 titles
+    videos: 3 titles
+- reddit_post
+
+Important: 
+- Return ONLY a valid JSON. Do not include ```json``` or any explanations.
+
+TEXT:
 {extracted_text[:3500]}
 """
-    response = openai.ChatCompletion.create(
+    response = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
     )
@@ -70,7 +81,7 @@ Text:
         return {"raw_text": raw_text}
 
 def files_already_processed(folder):
-    """Verifica si cover.jpg y metadata.json ya existen en la carpeta."""
+    """Check if cover and metadata already exist."""
     existing = set()
     resp = s3.list_objects_v2(Bucket=BUCKET_NAME, Prefix=f"{folder}/")
     for obj in resp.get("Contents", []):
@@ -81,8 +92,13 @@ def files_already_processed(folder):
             existing.add("metadata")
     return "cover" in existing and "metadata" in existing
 
+def copy_and_delete(old_key, new_key):
+    """Move object inside R2 (copy+delete)."""
+    s3.copy_object(Bucket=BUCKET_NAME, CopySource=f"{BUCKET_NAME}/{old_key}", Key=new_key)
+    s3.delete_object(Bucket=BUCKET_NAME, Key=old_key)
+
 # -------------------------------------------------------------------
-# RUTAS
+# ROUTES
 # -------------------------------------------------------------------
 
 @app.route("/", methods=["GET"])
@@ -97,33 +113,44 @@ def analyze_pdf():
         if not pdf_key:
             return jsonify({"error": "pdf_key is required"}), 400
 
-        # Carpeta y nombres base
+        # Extract current folder and file
         folder, filename = pdf_key.rsplit('/', 1)
-        cover_key = f"{folder}/cover.jpg"
-        meta_key = f"{folder}/metadata.json"
+        temp_folder = folder
+        temp_filename = filename
+        local_pdf = "/tmp/book.pdf"
 
-        # Verificar si ya está procesado
-        if files_already_processed(folder):
+        # Check duplicates in current folder
+        if files_already_processed(temp_folder):
             return jsonify({
                 "file": pdf_key,
                 "status": "already_processed",
-                "cover_image": cover_key,
-                "metadata_json": meta_key
+                "cover_image": f"{temp_folder}/cover.jpg",
+                "metadata_json": f"{temp_folder}/metadata.json"
             })
 
-        # Descargar PDF desde R2
-        local_pdf = "/tmp/book.pdf"
+        # Download PDF
         s3.download_file(BUCKET_NAME, pdf_key, local_pdf)
 
-        # Procesar PDF
+        # Extract text and cover
         extracted_text, cover_path = extract_pdf_text_and_cover(local_pdf)
         metadata = get_book_metadata(extracted_text)
 
-        # Subir cover
+        # Use clean title and category for final path
+        clean_title = clean_filename(metadata.get("clean_title", filename.replace(".pdf","")))
+        category = metadata.get("category", "Uncategorized").replace(" ", "_")
+        final_folder = f"{category}/PDF/{clean_title}"
+
+        # Move original PDF to final path
+        final_pdf_key = f"{final_folder}/{clean_title}.pdf"
+        copy_and_delete(pdf_key, final_pdf_key)
+
+        # Upload cover
+        cover_key = f"{final_folder}/cover.jpg"
         with open(cover_path, "rb") as f:
             s3.upload_fileobj(f, BUCKET_NAME, cover_key)
 
-        # Subir metadata
+        # Upload metadata
+        meta_key = f"{final_folder}/metadata.json"
         s3.put_object(
             Bucket=BUCKET_NAME,
             Key=meta_key,
@@ -132,10 +159,11 @@ def analyze_pdf():
         )
 
         return jsonify({
-            "file": pdf_key,
             "status": "processed",
-            "cover_image_uploaded_to": cover_key,
-            "metadata_json_uploaded_to": meta_key,
+            "original_pdf": pdf_key,
+            "final_pdf": final_pdf_key,
+            "cover_image": cover_key,
+            "metadata_json": meta_key,
             "metadata": metadata
         })
 
