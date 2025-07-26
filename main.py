@@ -79,7 +79,6 @@ Text:
     try:
         return json.loads(raw_text)
     except Exception:
-        # Si la respuesta no es JSON válido
         return {"raw_text": raw_text}
 
 # -------------------------------------------------------------------
@@ -106,12 +105,12 @@ def analyze_pdf():
         extracted_text, cover_path = extract_pdf_text_and_cover(local_pdf)
         metadata = get_book_metadata(extracted_text)
 
-        # Obtener el directorio base donde está el PDF
-        base_dir = os.path.dirname(pdf_key)
+        # Obtener carpeta (sin agregar subcarpeta extra)
+        folder, filename = pdf_key.rsplit('/', 1)
 
-        # Guardar portada y metadata al mismo nivel
-        cover_key = f"{base_dir}/cover.jpg"
-        meta_key = f"{base_dir}/metadata.json"
+        # Guardar cover y metadata en la misma carpeta que el PDF
+        cover_key = f"{folder}/cover.jpg"
+        meta_key = f"{folder}/metadata.json"
 
         # Subir portada
         with open(cover_path, "rb") as f:
