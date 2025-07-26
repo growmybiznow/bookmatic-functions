@@ -15,13 +15,13 @@ app = Flask(__name__)
 # Configuración de OpenAI y R2
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# Aquí usamos R2_ENDPOINT (no R2_ENDPOINT_URL)
+# Variables de entorno para R2
 R2_ENDPOINT = os.getenv("R2_ENDPOINT")
 R2_KEY = os.getenv("R2_ACCESS_KEY_ID")
 R2_SECRET = os.getenv("R2_SECRET_ACCESS_KEY")
 BUCKET_NAME = "bookmatic"
 
-# Cliente S3 para R2
+# Cliente boto3 apuntando a Cloudflare R2
 s3 = boto3.client(
     "s3",
     endpoint_url=R2_ENDPOINT,
@@ -33,14 +33,16 @@ s3 = boto3.client(
 # FUNCIONES DE UTILIDAD
 # -------------------------------------------------------------------
 
-def clean_filename(text):
+def clean_filename(text: str) -> str:
     return re.sub(r'[^a-zA-Z0-9]+', '_', text.lower()).strip('_')
 
 def extract_pdf_text_and_cover(local_file):
-    """Extraer texto (páginas 2-6) y generar imagen JPG de portada"""
+    """
+    Extrae texto (páginas 2-6) y genera imagen JPG de la portada.
+    """
     doc = fitz.open(local_file)
 
-    # Guardar la portada como JPG
+    # Generar la imagen de la portada
     cover_image = doc[0].get_pixmap(dpi=150)
     cover_path = local_file.replace(".pdf", "_cover.jpg")
     cover_image.save(cover_path)
@@ -53,7 +55,9 @@ def extract_pdf_text_and_cover(local_file):
     return extracted_text, cover_path
 
 def get_book_metadata(extracted_text):
-    """Pide a OpenAI metadatos en JSON"""
+    """
+    Pide a OpenAI metadatos estructurados en JSON.
+    """
     prompt = f"""
 Analyze this text and return JSON with:
 - clean_title
@@ -72,10 +76,10 @@ Text:
     )
     raw_text = response.choices[0].message.content
 
-    # Intentar parsear JSON
     try:
         return json.loads(raw_text)
     except Exception:
+        # Si la respuesta no es JSON válido
         return {"raw_text": raw_text}
 
 # -------------------------------------------------------------------
@@ -94,21 +98,26 @@ def analyze_pdf():
         if not pdf_key:
             return jsonify({"error": "pdf_key is required"}), 400
 
-        # Descargar PDF desde R2
+        # Descargar PDF desde R2 a /tmp
         local_pdf = "/tmp/book.pdf"
         s3.download_file(BUCKET_NAME, pdf_key, local_pdf)
 
-        # Procesar PDF
+        # Procesar PDF (extraer texto y portada)
         extracted_text, cover_path = extract_pdf_text_and_cover(local_pdf)
         metadata = get_book_metadata(extracted_text)
 
-        # Subir la portada al mismo directorio en R2
-        cover_key = pdf_key.replace(".pdf", "/cover.jpg")
+        # Obtener el directorio base donde está el PDF
+        base_dir = os.path.dirname(pdf_key)
+
+        # Guardar portada y metadata al mismo nivel
+        cover_key = f"{base_dir}/cover.jpg"
+        meta_key = f"{base_dir}/metadata.json"
+
+        # Subir portada
         with open(cover_path, "rb") as f:
             s3.upload_fileobj(f, BUCKET_NAME, cover_key)
 
-        # Guardar metadata.json en R2
-        meta_key = pdf_key.replace(".pdf", "/metadata.json")
+        # Subir metadata
         s3.put_object(
             Bucket=BUCKET_NAME,
             Key=meta_key,
